@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, status,Query
+from fastapi import APIRouter, HTTPException, status, Query
 from pydantic import BaseModel, Field, constr
 from typing import List, Optional
 from datetime import datetime, timezone
@@ -31,7 +31,6 @@ async def _enqueue_to_queue(message: dict) -> None:
 # ====== Pydantic 모델 ======
 # 클라이언트가 "코드 제출" 시 보내는 요청(request) 데이터 구조
 class SubmissionCreate(BaseModel):
-    assignment_id: constr(strip_whitespace=True, min_length=1)
     language: constr(strip_whitespace=True, min_length=1) = "python"
     code: str
 
@@ -50,7 +49,6 @@ class Metrics(BaseModel):
 class SubmissionOut(BaseModel):
     submission_id: str
     user_id: Optional[str] = None
-    assignment_id: str
     language: str = "python"
     status: constr(pattern="^(QUEUED|FAILED|COMPLETED|TIMEOUT|FINALIZED|SUCCESSED)$")
     score: float = 0
@@ -80,11 +78,10 @@ class FinalizeOut(BaseModel):
 
 class SubmissionListItem(BaseModel):
     submission_id: str
-    assignment_id: str
     language: str
     status: str
     score: float = 0
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
 class SubmissionListOut(BaseModel):
     items: List[SubmissionListItem]
@@ -112,7 +109,6 @@ def _doc_to_out(doc: dict) -> SubmissionOut:
     return SubmissionOut(
         submission_id=doc["_id"],
         user_id=doc.get("user_id"),
-        assignment_id=doc["assignment_id"],
         language=doc.get("language", "python"),
         status=doc.get("status", "QUEUED"),
         score=float(doc.get("score", 0) or 0),
@@ -136,10 +132,10 @@ async def create_submission(payload: SubmissionCreate):
     now = datetime.now(timezone.utc)
 
     # 1) DB 저장 (status=QUEUED)
+    submission_id = str(ObjectId())
     doc = {
-        "_id": str(ObjectId()),
+        "_id": submission_id,
         "user_id": "u1",  # 데모/시연: 하드코딩 사용자
-        "assignment_id": payload.assignment_id,
         "language": payload.language,
         "code": payload.code,
         "status": "QUEUED",
@@ -158,8 +154,7 @@ async def create_submission(payload: SubmissionCreate):
     # 2) Redis 큐 등록
     await _enqueue_to_queue(
         {
-            "submission_id": doc["_id"],
-            "assignment_id": doc["assignment_id"],
+            "submission_id": submission_id,
             "language": doc["language"],
         }
     )
@@ -202,20 +197,20 @@ async def finalize_submission(submission_id: str, body: FinalizeIn):
 # ====== (5) 리스트조회: GET /submissions ======
 @router.get("", response_model=SubmissionListOut)
 async def list_submissions(
-    assignment_id: Optional[str] = None,
+    submission_id: Optional[str] = None,
     status: Optional[str] = None,  # "QUEUED|FAILED|COMPLETED|TIMEOUT|FINALIZED|SUCCESSED"
     page: int = Query(1, ge=1),
     size: int = Query(10, ge=1, le=100),
 ):
     """
     제출 목록 조회 (가벼운 필드만 반환)
-    - 필터: assignment_id, status
+    - 필터: submission_id, status
     - 페이징: page, size
     - 정렬: 최신(created_at desc)
     """
     q: dict = {}
-    if assignment_id:
-        q["assignment_id"] = assignment_id
+    if submission_id:
+        q["_id"] = submission_id
     if status:
         q["status"] = status
 
@@ -241,7 +236,6 @@ async def list_submissions(
     items = [
         SubmissionListItem(
             submission_id=d["_id"],
-            assignment_id=d["assignment_id"],
             language=d.get("language", "python"),
             status=d.get("status", "QUEUED"),
             score=float(d.get("score", 0) or 0),
