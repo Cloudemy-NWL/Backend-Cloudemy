@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status,Query
 from pydantic import BaseModel, Field, constr
 from typing import List, Optional
 from datetime import datetime, timezone
@@ -78,12 +78,19 @@ class FinalizeOut(BaseModel):
     finalized: bool = True
 
 
-class SubmissionSummary(BaseModel):
+class SubmissionListItem(BaseModel):
+    submission_id: str
+    assignment_id: str
+    language: str
     status: str
-    code: str
-    fail_tags: List[str] = Field(default_factory=list)
-    feedback: List[FeedbackItem] = Field(default_factory=list)
+    score: float = 0
     created_at: datetime
+
+class SubmissionListOut(BaseModel):
+    items: List[SubmissionListItem]
+    total: int
+    page: int
+    size: int
 
 # ====== 헬퍼 ======
 
@@ -192,15 +199,56 @@ async def finalize_submission(submission_id: str, body: FinalizeIn):
             raise HTTPException(409, "finalize conflict")
     return FinalizeOut(submission_id=submission_id)
 
-# ====== (5) 요약 조회: GET /submissions/{submission_id}/summary ======
-@router.get("/{submission_id}/summary", response_model=SubmissionSummary)
-async def get_submission_summary(submission_id: str):
-    doc = await _get_doc_or_404(submission_id)
-    return SubmissionSummary(
-        status=doc.get("status", "QUEUED"), 
-        code=doc.get("code", ""),
-        fail_tags=list(doc.get("fail_tags", [])),
-        feedback=[FeedbackItem(**x) for x in doc.get("feedback", [])],
-        created_at=doc.get("created_at"),
+# ====== (5) 리스트조회: GET /submissions ======
+@router.get("", response_model=SubmissionListOut)
+async def list_submissions(
+    assignment_id: Optional[str] = None,
+    status: Optional[str] = None,  # "QUEUED|FAILED|COMPLETED|TIMEOUT|FINALIZED|SUCCESSED"
+    page: int = Query(1, ge=1),
+    size: int = Query(10, ge=1, le=100),
+):
+    """
+    제출 목록 조회 (가벼운 필드만 반환)
+    - 필터: assignment_id, status
+    - 페이징: page, size
+    - 정렬: 최신(created_at desc)
+    """
+    q: dict = {}
+    if assignment_id:
+        q["assignment_id"] = assignment_id
+    if status:
+        q["status"] = status
+
+    coll = COLL()
+    total = await coll.count_documents(q)
+
+    cursor = (
+        coll.find(
+            q,
+            projection={
+                "code": 0,        # 무거운 필드 제외
+                "feedback": 0,
+                "metrics": 0,
+            },
+        )
+        .sort("created_at", -1)
+        .skip((page - 1) * size)
+        .limit(size)
     )
+
+    docs = [d async for d in cursor]
+
+    items = [
+        SubmissionListItem(
+            submission_id=d["_id"],
+            assignment_id=d["assignment_id"],
+            language=d.get("language", "python"),
+            status=d.get("status", "QUEUED"),
+            score=float(d.get("score", 0) or 0),
+            created_at=d.get("created_at"),
+        )
+        for d in docs
+    ]
+
+    return SubmissionListOut(items=items, total=total, page=page, size=size)
 
