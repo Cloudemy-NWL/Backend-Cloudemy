@@ -5,11 +5,19 @@ services:
     image: mongo:6
     container_name: mongo_db
     restart: unless-stopped
+    command: ["--bind_ip_all"]            # 모든 인터페이스에서 수신
     ports:
       - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: cloudemy     # 초기 기본 DB (옵션)
     volumes:
       - mongo_data:/data/db
-  
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' | grep 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   redis:
     image: redis:7
     container_name: redis_queue
@@ -18,6 +26,11 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
 volumes:
   mongo_data:

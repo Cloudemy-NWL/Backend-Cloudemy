@@ -1,15 +1,19 @@
-from fastapi import APIRouter, HTTPException, status, Depends
-from pydantic import BaseModel, Field, constr
-from typing import List, Optional, Dict, Any
-from datetime import datetime, timezone
+import json
+import logging
+import os
+from typing import Dict, List, Optional
+
 from bson import ObjectId
-import os, json
+from fastapi import APIRouter, HTTPException, status
+from pydantic import BaseModel, Field, constr
+from pymongo.errors import PyMongoError
+from redis.exceptions import RedisError
 
 # Redis (async)
 from redis.asyncio import Redis
 
 # Mongo (전역 연결)
-from app.db import db
+from app.db import get_db
 
 router = APIRouter(prefix="/submissions", tags=["submissions"])
 
@@ -18,8 +22,6 @@ STATUSES = {"QUEUED", "FAILED", "COMPLETED", "TIMEOUT", "FINALIZED"}
 QUEUE_NAME = os.getenv("QUEUE_SUBMISSIONS", "queue:submissions")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
 
 async def _enqueue_to_queue(message: dict) -> None:
     r = Redis.from_url(REDIS_URL, decode_responses=True)
@@ -71,7 +73,8 @@ class FinalizeOut(BaseModel):
     finalized: bool = True
 
 # ====== 헬퍼 ======
-COLL = lambda: db.submissions  # type: ignore
+def COLL():
+    return get_db().submissions
 
 async def _get_doc_or_404(submission_id: str) -> dict:
     doc = await COLL().find_one({"_id": submission_id})
@@ -114,19 +117,32 @@ async def create_submission(payload: SubmissionCreate):
         "metrics": _default_metrics(),
         "finalized": False,
         "attempt": 1,  # 시연 고정
-        "created_at": _now_utc(),
-        "updated_at": _now_utc(),
     }
-    await COLL().insert_one(doc)
+    try:
+        await COLL().insert_one(doc)
+    except PyMongoError as exc:
+        logging.getLogger(__name__).exception("Failed to insert submission")
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="database unavailable",
+        ) from exc
 
     # 2) Redis 큐 등록
-    await _enqueue_to_queue(
-        {
-            "submission_id": doc["_id"],
-            "assignment_id": doc["assignment_id"],
-            "language": doc["language"],
-        }
-    )
+    try:
+        await _enqueue_to_queue(
+            {
+                "submission_id": doc["_id"],
+                "assignment_id": doc["assignment_id"],
+                "language": doc["language"],
+            }
+        )
+    except RedisError as exc:
+        logging.getLogger(__name__).exception("Failed to enqueue submission")
+        await COLL().delete_one({"_id": doc["_id"]})
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="queue unavailable",
+        ) from exc
 
     return SubmissionQueued(submission_id=doc["_id"], status="QUEUED", attempt=1)
 
@@ -153,8 +169,6 @@ async def finalize_submission(submission_id: str, body: FinalizeIn):
                 "status": "FINALIZED",
                 "finalized": True,
                 "finalize_note": body.note,
-                "finalized_at": _now_utc(),
-                "updated_at": _now_utc(),
             }
         },
     )

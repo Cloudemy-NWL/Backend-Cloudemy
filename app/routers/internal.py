@@ -4,7 +4,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 import os
 
-from app.db import db
+from app.db import get_db
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
@@ -34,7 +34,8 @@ class OkOut(BaseModel):
     submission_id: str
     status: str
 
-COLL = lambda: db.submissions  # type: ignore
+def COLL():
+    return get_db().submissions
 
 @router.post(
     "/submissions/{submission_id}/result",
