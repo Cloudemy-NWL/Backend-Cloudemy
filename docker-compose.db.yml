@@ -9,6 +9,16 @@ services:
       - "27017:27017"
     volumes:
       - mongo_data:/data/db
+  
+  redis:
+    image: redis:7
+    container_name: redis_queue
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
 
 volumes:
   mongo_data:
+  redis_data:
