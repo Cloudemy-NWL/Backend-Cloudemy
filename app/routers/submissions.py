@@ -168,30 +168,46 @@ async def get_submission(submission_id: str):
     return _doc_to_out(doc)
 
 # ====== (4) 최종 제출 확정: POST /submissions/{id}/finalize ======
+# ====== (4) 최종 제출 확정: POST /submissions/{id}/finalize ======
 @router.post("/{submission_id}/finalize", response_model=FinalizeOut)
 async def finalize_submission(submission_id: str, body: FinalizeIn):
+    # 1) 현재 제출 찾기
     doc = await _get_doc_or_404(submission_id)
+    user_id = doc.get("user_id")
 
-    # 이미 최종화면 idempotent하게 응답
+    # 2) 이미 최종화된 같은 제출이면 그대로 OK(idempotent)
     if doc.get("finalized"):
         return FinalizeOut(submission_id=submission_id)
 
-    # 잠금 + 상태 FINALIZED
+    # 3) 같은 user_id로 이미 최종 제출이 있는지 확인
+    existing = await COLL().find_one({
+        "user_id": user_id,
+        "finalized": True
+    })
+    # 이미 최종 제출이 있고, 그게 이번 제출이 아니라면 차단
+    if existing and existing.get("_id") != submission_id:
+        raise HTTPException(
+            status_code=409,
+            detail="finalized_submission_exists_for_user"
+        )
+
+    # 4) 현재 제출을 FINALIZED로 업데이트
     res = await COLL().update_one(
         {"_id": submission_id, "finalized": {"$ne": True}},
-        {
-            "$set": {
-                "status": "FINALIZED",
-                "finalized": True,
-                "finalize_note": body.note,
-            }
-        },
+        {"$set": {
+            "status": "FINALIZED",
+            "finalized": True,
+            "finalize_note": body.note
+        }}
     )
+
+    # 경합으로 동시에 들어온 경우 방어
     if res.matched_count == 0:
-        # 경쟁상황으로 이미 finalize 된 경우
+        # 다시 조회해서 최종화 여부 확인
         doc = await _get_doc_or_404(submission_id)
         if not doc.get("finalized"):
-            raise HTTPException(409, "finalize conflict")
+            raise HTTPException(status_code=409, detail="finalize_conflict")
+
     return FinalizeOut(submission_id=submission_id)
 
 # ====== (5) 리스트조회: GET /submissions ======
