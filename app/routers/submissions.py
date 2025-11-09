@@ -1,13 +1,9 @@
-import json
-import logging
-import os
-from typing import Dict, List, Optional
-
-from bson import ObjectId
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field, constr
-from pymongo.errors import PyMongoError
-from redis.exceptions import RedisError
+from typing import List, Optional
+from datetime import datetime, timezone
+from bson import ObjectId
+import os, json
 
 # Redis (async)
 from redis.asyncio import Redis
@@ -18,11 +14,12 @@ from app.db import get_db
 router = APIRouter(prefix="/submissions", tags=["submissions"])
 
 # ====== 공통 ======
-STATUSES = {"QUEUED", "FAILED", "COMPLETED", "TIMEOUT", "FINALIZED"}
+STATUSES = {"QUEUED", "FAILED", "COMPLETED", "TIMEOUT", "FINALIZED", "SUCCESSED"}
 QUEUE_NAME = os.getenv("QUEUE_SUBMISSIONS", "queue:submissions")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 
+# Redis 큐 등록 함수 
 async def _enqueue_to_queue(message: dict) -> None:
     r = Redis.from_url(REDIS_URL, decode_responses=True)
     try:
@@ -30,58 +27,80 @@ async def _enqueue_to_queue(message: dict) -> None:
     finally:
         await r.close()
 
-def _default_metrics() -> Dict[str, int]:
-    return {"timeMs": 0, "memoryMB": 0}
 
 # ====== Pydantic 모델 ======
+# 클라이언트가 "코드 제출" 시 보내는 요청(request) 데이터 구조
 class SubmissionCreate(BaseModel):
     assignment_id: constr(strip_whitespace=True, min_length=1)
     language: constr(strip_whitespace=True, min_length=1) = "python"
     code: str
 
+# 채점기(Runner)가 "케이스별 피드백"을 보낼 때 사용하는 구조 
 class FeedbackItem(BaseModel):
     case: str
     message: str
 
+
+# 서버가 "제출 결과"를 응답할 때 사용하는 전체 구조
 class Metrics(BaseModel):
     timeMs: int = 0
     memoryMB: int = 0
+
 
 class SubmissionOut(BaseModel):
     submission_id: str
     user_id: Optional[str] = None
     assignment_id: str
     language: str = "python"
-    status: constr(pattern="^(QUEUED|FAILED|COMPLETED|TIMEOUT|FINALIZED)$")
+    status: constr(pattern="^(QUEUED|FAILED|COMPLETED|TIMEOUT|FINALIZED|SUCCESSED)$")
     score: float = 0
     fail_tags: List[str] = Field(default_factory=list)
     feedback: List[FeedbackItem] = Field(default_factory=list)
     metrics: Metrics = Field(default_factory=Metrics)
     finalized: bool = False
+    created_at: datetime
 
+# 학생이 코드 제출한 직후(POST /submissions) FastAPI가 응답으로 주는 모델 (큐 등록 상태 표현) 
 class SubmissionQueued(BaseModel):
     submission_id: str
     status: str = "QUEUED"
     attempt: int = 1
+    created_at: datetime
 
+# 학생이 "최종 제출" 버튼을 눌렀을 때 보내는 요청(request) 구조 
 class FinalizeIn(BaseModel):
     note: Optional[str] = None
 
+# 서버가 최종 제출 확정 후 응답(response)으로 반환하는 구조 
 class FinalizeOut(BaseModel):
     submission_id: str
     status: str = "FINALIZED"
     finalized: bool = True
 
+
+class SubmissionSummary(BaseModel):
+    status: str
+    code: str
+    fail_tags: List[str] = Field(default_factory=list)
+    feedback: List[FeedbackItem] = Field(default_factory=list)
+    created_at: datetime
+
 # ====== 헬퍼 ======
+
+# db.submissions를 매번 쓰지 않고 COLL()로 접근하게 함
 def COLL():
     return get_db().submissions
 
+
+# 특정 제출 ID로 MongoDB에서 문서를 찾는 함수 (문서에 없으면 404 에러)
 async def _get_doc_or_404(submission_id: str) -> dict:
     doc = await COLL().find_one({"_id": submission_id})
     if not doc:
         raise HTTPException(status_code=404, detail="submission not found")
     return doc
 
+
+# MongoDB 문서를 SubmissionOut 응답 모델(Pydantic 객체)로 변환 
 def _doc_to_out(doc: dict) -> SubmissionOut:
     return SubmissionOut(
         submission_id=doc["_id"],
@@ -92,9 +111,12 @@ def _doc_to_out(doc: dict) -> SubmissionOut:
         score=float(doc.get("score", 0) or 0),
         fail_tags=list(doc.get("fail_tags", [])),
         feedback=[FeedbackItem(**x) for x in doc.get("feedback", [])],
-        metrics=Metrics(**(doc.get("metrics") or _default_metrics())),
+        metrics=Metrics(**(doc.get("metrics") or {})),
         finalized=bool(doc.get("finalized", False)),
+        created_at=doc.get("created_at"),
     )
+
+
 
 # ====== (1) 코드 제출: POST /submissions ======
 @router.post(
@@ -103,6 +125,9 @@ def _doc_to_out(doc: dict) -> SubmissionOut:
     status_code=status.HTTP_201_CREATED,
 )
 async def create_submission(payload: SubmissionCreate):
+
+    now = datetime.now(timezone.utc)
+
     # 1) DB 저장 (status=QUEUED)
     doc = {
         "_id": str(ObjectId()),
@@ -114,37 +139,25 @@ async def create_submission(payload: SubmissionCreate):
         "score": 0,
         "fail_tags": [],
         "feedback": [],
-        "metrics": _default_metrics(),
+        "metrics": Metrics().model_dump(),
         "finalized": False,
         "attempt": 1,  # 시연 고정
+        "created_at": now, 
     }
-    try:
-        await COLL().insert_one(doc)
-    except PyMongoError as exc:
-        logging.getLogger(__name__).exception("Failed to insert submission")
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="database unavailable",
-        ) from exc
+
+    # 비동기 DB 삽입 명령 
+    await COLL().insert_one(doc)
 
     # 2) Redis 큐 등록
-    try:
-        await _enqueue_to_queue(
-            {
-                "submission_id": doc["_id"],
-                "assignment_id": doc["assignment_id"],
-                "language": doc["language"],
-            }
-        )
-    except RedisError as exc:
-        logging.getLogger(__name__).exception("Failed to enqueue submission")
-        await COLL().delete_one({"_id": doc["_id"]})
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="queue unavailable",
-        ) from exc
+    await _enqueue_to_queue(
+        {
+            "submission_id": doc["_id"],
+            "assignment_id": doc["assignment_id"],
+            "language": doc["language"],
+        }
+    )
 
-    return SubmissionQueued(submission_id=doc["_id"], status="QUEUED", attempt=1)
+    return SubmissionQueued(submission_id=doc["_id"], status="QUEUED", attempt=1, created_at=now)
 
 # ====== (3) 제출 결과 조회: GET /submissions/{id} ======
 @router.get("/{submission_id}", response_model=SubmissionOut)
@@ -178,3 +191,16 @@ async def finalize_submission(submission_id: str, body: FinalizeIn):
         if not doc.get("finalized"):
             raise HTTPException(409, "finalize conflict")
     return FinalizeOut(submission_id=submission_id)
+
+# ====== (5) 요약 조회: GET /submissions/{submission_id}/summary ======
+@router.get("/{submission_id}/summary", response_model=SubmissionSummary)
+async def get_submission_summary(submission_id: str):
+    doc = await _get_doc_or_404(submission_id)
+    return SubmissionSummary(
+        status=doc.get("status", "QUEUED"), 
+        code=doc.get("code", ""),
+        fail_tags=list(doc.get("fail_tags", [])),
+        feedback=[FeedbackItem(**x) for x in doc.get("feedback", [])],
+        created_at=doc.get("created_at"),
+    )
+

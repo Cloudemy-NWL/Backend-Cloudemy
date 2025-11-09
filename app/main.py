@@ -4,8 +4,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.db import lifespan
 from app.routers import submissions, internal
 
-app = FastAPI(lifespan=lifespan)  # ✅ 꼭 이렇게!
+# lifespan=lifespan ➜ MongoDB 연결/해제를 자동으로 수행
+app = FastAPI(lifespan=lifespan) 
 
+# CORS 설정
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -14,5 +16,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 라우터 등록
 app.include_router(submissions.router)
 app.include_router(internal.router)
